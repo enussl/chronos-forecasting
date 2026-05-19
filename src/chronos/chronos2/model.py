@@ -543,8 +543,9 @@ class Chronos2Model(PreTrainedModel):
         loss_mask = future_target_mask.float() * inv_future_covariate_mask
         loss = quantile_loss * loss_mask
         # mean over prediction horizon, sum over quantile levels and mean over batch
-        loss = loss.mean(dim=-1).sum(dim=-1).mean()
-
+        # Change here! only averaged over non-zero losses (only for target not covariates)
+        denom = loss_mask.sum(dim=-1).clamp_min(1.0)
+        loss = (loss.sum(dim=-1) / denom).sum(dim=-1).mean()
         return loss
 
     def encode(
