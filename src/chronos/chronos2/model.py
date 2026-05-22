@@ -496,8 +496,11 @@ class Chronos2Model(PreTrainedModel):
 
         return patched_future, patched_future_covariates_mask
 
+    
+    
     def _compute_loss(
         self,
+        context: torch.Tensor,
         quantile_preds: torch.Tensor,
         future_target: torch.Tensor,
         future_target_mask: torch.Tensor | None,
@@ -508,21 +511,22 @@ class Chronos2Model(PreTrainedModel):
         batch_size = future_target.shape[0]
         output_patch_size = self.chronos_config.output_patch_size
 
-        lam_mse = 0.3
-        lam_move = 0.02
-        min_move_ratio = 0.4
+        lambda_q = 0.05
+        lambda_delta = 0.3
         eps = 1e-6
 
-        assert (
-            quantile_preds.shape[0] == batch_size
-            and quantile_preds.shape[-1] >= future_target.shape[-1]
-        )
-
-        # ---------------------------------------------------------------------
-        # Normalize target using same loc/scale as context
-        # ---------------------------------------------------------------------
         future_target, _ = self.instance_norm(future_target, loc_scale)
         future_target = future_target.unsqueeze(1).to(self.device)
+
+        context_normed, _ = self.instance_norm(context, loc_scale)
+        context_normed = context_normed.to(self.device)
+
+        context_mask = ~torch.isnan(context_normed)
+        last_context_idx = context_mask.long().sum(dim=-1).clamp_min(1) - 1
+        last_context_value = context_normed[
+            torch.arange(batch_size, device=self.device),
+            last_context_idx,
+        ].view(batch_size, 1, 1)
 
         future_target_mask = (
             future_target_mask.unsqueeze(1).to(self.device)
@@ -536,9 +540,6 @@ class Chronos2Model(PreTrainedModel):
             torch.zeros_like(future_target),
         )
 
-        # ---------------------------------------------------------------------
-        # Pad target and mask if model predicts longer than observed horizon
-        # ---------------------------------------------------------------------
         if quantile_preds.shape[-1] > future_target.shape[-1]:
             padding_shape = (
                 *future_target.shape[:-1],
@@ -555,9 +556,6 @@ class Chronos2Model(PreTrainedModel):
                 dim=-1,
             )
 
-        # ---------------------------------------------------------------------
-        # Build mask: valid future target AND not known future covariate
-        # ---------------------------------------------------------------------
         inv_future_covariate_mask = 1 - rearrange(
             patched_future_covariates_mask,
             "b n p -> b 1 (n p)",
@@ -567,12 +565,15 @@ class Chronos2Model(PreTrainedModel):
         )
 
         loss_mask = future_target_mask.float() * inv_future_covariate_mask.float()
+        valid_count = loss_mask.sum()
 
-        valid_count = loss_mask.sum().clamp_min(1.0)
+        if valid_count.item() == 0:
+            return quantile_preds.sum() * 0.0
 
-        # ---------------------------------------------------------------------
-        # Quantile loss, masked without dilution by padded positions
-        # ---------------------------------------------------------------------
+        q50_idx = torch.argmin(torch.abs(self.quantiles - 0.5)).item()
+        pred_median = quantile_preds[:, q50_idx:q50_idx + 1, :]
+
+        # Quantile loss
         quantiles = rearrange(
             self.quantiles,
             "num_quantiles -> 1 num_quantiles 1",
@@ -585,34 +586,34 @@ class Chronos2Model(PreTrainedModel):
 
         q_loss = (quantile_loss * loss_mask).sum() / valid_count
 
-        # ---------------------------------------------------------------------
-        # Auxiliary MSE on median forecast
-        # ---------------------------------------------------------------------
-        q50_idx = torch.argmin(torch.abs(self.quantiles - 0.5)).item()
-        pred_median = quantile_preds[:, q50_idx:q50_idx + 1, :]
+        # Level RMSE
+        level_mse = (
+            ((pred_median - future_target) ** 2) * loss_mask
+        ).sum() / valid_count
 
-        mse_loss = ((pred_median - future_target) ** 2 * loss_mask).sum() / valid_count
+        level_rmse = torch.sqrt(level_mse + eps)
 
-        # ---------------------------------------------------------------------
-        # Movement loss: punish overly flat predictions
-        # ---------------------------------------------------------------------
-        pred_deltas = pred_median[..., 1:] - pred_median[..., :-1]
-        true_deltas = future_target[..., 1:] - future_target[..., :-1]
+        # Delta RMSE
+        # First delta uses true last observed context value:
+        # pred_t - true_{t-1} versus true_t - true_{t-1}
+        pred_with_base = torch.cat([last_context_value, pred_median], dim=-1)
+        true_with_base = torch.cat([last_context_value, future_target], dim=-1)
 
-        move_mask = loss_mask[..., 1:] * loss_mask[..., :-1]
-        move_count = move_mask.sum().clamp_min(1.0)
+        pred_deltas = pred_with_base[..., 1:] - pred_with_base[..., :-1]
+        true_deltas = true_with_base[..., 1:] - true_with_base[..., :-1]
 
-        pred_move = (pred_deltas.abs() * move_mask).sum() / move_count
-        true_move = (true_deltas.abs() * move_mask).sum() / move_count
+        delta_mse = (
+            ((pred_deltas - true_deltas) ** 2) * loss_mask
+        ).sum() / valid_count
 
-        move_ratio = pred_move / (true_move.detach() + eps)
-        movement_loss = torch.relu(min_move_ratio - move_ratio) ** 2
+        delta_rmse = torch.sqrt(delta_mse + eps)
 
-        # If horizon length is 1, movement loss is not meaningful.
-        if future_target.shape[-1] <= 1:
-            movement_loss = torch.zeros_like(q_loss)
+        rmse_part = (
+            (1.0 - lambda_delta) * level_rmse
+            + lambda_delta * delta_rmse
+        )
 
-        loss = q_loss + lam_mse * mse_loss + lam_move * movement_loss
+        loss = lambda_q * q_loss + (1.0 - lambda_q) * rmse_part
 
         return loss
 
@@ -790,6 +791,7 @@ class Chronos2Model(PreTrainedModel):
 
         loss = (
             self._compute_loss(
+                context=context,
                 quantile_preds=quantile_preds,
                 future_target=future_target,
                 future_target_mask=future_target_mask,
