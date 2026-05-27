@@ -629,24 +629,20 @@ class Chronos2Model(PreTrainedModel):
         """
         Compute quantile loss on both levels (actual values) and first differences (changes).
         
-        This approach:
-        - Uses quantile loss on levels (what is the predicted value?)
-        - Uses quantile loss on deltas (what is the predicted change?)
-        - Combines both with equal weighting
-        
-        Advantages:
-        - Both losses use the same quantile loss formula (balanced)
-        - Naturally handles both absolute accuracy and temporal consistency
-        - Single loss type is simpler to understand and tune
+        Shapes:
+        - context: (batch, seq_context)
+        - future_target: (batch, seq_future)
+        - quantile_preds: (batch, num_quantiles, seq_future)
+        - future_target_mask: (batch, seq_future) or None
         """
         batch_size = future_target.shape[0]
         output_patch_size = self.chronos_config.output_patch_size
         eps = 1e-6
-        alpha = 0.5  # Weight between level and delta quantile losses (adjust as needed)
+        alpha = 0.5  # Weight between level and delta quantile losses
 
         # ========== NORMALIZE TARGETS ==========
         future_target, _ = self.instance_norm(future_target, loc_scale)
-        future_target = future_target.unsqueeze(1).to(self.device)
+        future_target = future_target.unsqueeze(1).to(self.device)  # (batch, 1, seq)
 
         # ========== GET CONTEXT BASELINE ==========
         context_normed, _ = self.instance_norm(context, loc_scale)
@@ -657,7 +653,7 @@ class Chronos2Model(PreTrainedModel):
         last_context_value = context_normed[
             torch.arange(batch_size, device=self.device),
             last_context_idx,
-        ].view(batch_size, 1, 1)
+        ].view(batch_size, 1, 1)  # (batch, 1, 1)
 
         # ========== HANDLE TARGET MASK ==========
         future_target_mask = (
@@ -696,7 +692,7 @@ class Chronos2Model(PreTrainedModel):
             p=output_patch_size,
         )
 
-        loss_mask = future_target_mask.float() * inv_future_covariate_mask.float()
+        loss_mask = future_target_mask.float() * inv_future_covariate_mask.float()  # (batch, 1, seq)
         valid_count = loss_mask.sum()
 
         if valid_count.item() == 0:
@@ -708,8 +704,12 @@ class Chronos2Model(PreTrainedModel):
             "num_quantiles -> 1 num_quantiles 1",
         )
 
+        # quantile_preds: (batch, num_quantiles, seq)
+        # future_target: (batch, 1, seq)
+        # loss_mask: (batch, 1, seq)
+        # Broadcasting handles the dimension mismatch automatically
         quantile_loss_levels = 2 * torch.abs(
-            (future_target - quantile_preds)
+            (future_target - quantile_preds)  # (batch, 1, seq) - (batch, num_quantiles, seq) = (batch, num_quantiles, seq)
             * ((future_target <= quantile_preds).float() - quantiles)
         )
 
@@ -717,39 +717,54 @@ class Chronos2Model(PreTrainedModel):
 
         # ========== QUANTILE LOSS ON FIRST DIFFERENCES ==========
         # Compute first differences (deltas) with context baseline
-        true_with_base = torch.cat([last_context_value, future_target], dim=-1)  # (batch, 1, seq+1)
-        pred_with_base = torch.cat([last_context_value, quantile_preds], dim=-1)  # (batch, num_quantiles, seq+1)
+        
+        # Expand last_context_value to match quantile dimension for proper concatenation
+        # (batch, 1, 1) -> (batch, num_quantiles, 1)
+        last_context_value_expanded = last_context_value.expand(batch_size, self.num_quantiles, 1)
+        
+        # Concat with predictions per quantile
+        # (batch, num_quantiles, 1) + (batch, num_quantiles, seq) = (batch, num_quantiles, seq+1)
+        pred_with_base = torch.cat([last_context_value_expanded, quantile_preds], dim=-1)
+        
+        # For targets, keep (batch, 1, seq+1) - will broadcast when needed
+        # (batch, 1, 1) + (batch, 1, seq) = (batch, 1, seq+1)
+        true_with_base = torch.cat([last_context_value, future_target], dim=-1)
 
-        true_deltas = true_with_base[..., 1:] - true_with_base[..., :-1]  # (batch, 1, seq)
-        pred_deltas = pred_with_base[..., 1:] - pred_with_base[..., :-1]  # (batch, num_quantiles, seq)
+        # Compute deltas (first differences)
+        # pred_deltas: (batch, num_quantiles, seq)
+        # true_deltas: (batch, 1, seq)
+        pred_deltas = pred_with_base[..., 1:] - pred_with_base[..., :-1]
+        true_deltas = true_with_base[..., 1:] - true_with_base[..., :-1]
 
-        # Normalize deltas by their standard deviation to make them comparable in scale to levels
-        # This prevents delta loss from being drowned out by level loss
+        # Normalize deltas by their standard deviation to make them comparable to levels
         true_delta_std = torch.std(true_deltas) + eps
         true_deltas_normalized = true_deltas / true_delta_std
         pred_deltas_normalized = pred_deltas / true_delta_std
 
         # Apply quantile loss to normalized deltas
+        # true_deltas_normalized: (batch, 1, seq)
+        # pred_deltas_normalized: (batch, num_quantiles, seq)
+        # Broadcasting: (batch, 1, seq) - (batch, num_quantiles, seq) = (batch, num_quantiles, seq)
         quantile_loss_deltas = 2 * torch.abs(
             (true_deltas_normalized - pred_deltas_normalized)
             * ((true_deltas_normalized <= pred_deltas_normalized).float() - quantiles)
         )
 
         # Mask for deltas (one fewer element due to differencing)
-        loss_mask_deltas = loss_mask[..., 1:]  # (batch, 1, seq)
+        # (batch, 1, seq-1)
+        loss_mask_deltas = loss_mask[..., 1:]
         valid_count_deltas = loss_mask_deltas.sum()
 
         if valid_count_deltas.item() == 0:
-            # If no valid deltas, skip delta loss
             q_loss_deltas = torch.tensor(0.0, device=self.device, dtype=self.dtype)
         else:
             q_loss_deltas = (quantile_loss_deltas * loss_mask_deltas).sum() / valid_count_deltas
 
         # ========== COMBINE LOSSES ==========
-        # Both are quantile losses, so they're balanced in scale
         loss = alpha * q_loss_levels + (1.0 - alpha) * q_loss_deltas
 
         return loss
+
 
 
     def encode(
