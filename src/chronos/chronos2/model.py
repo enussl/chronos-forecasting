@@ -496,8 +496,126 @@ class Chronos2Model(PreTrainedModel):
 
         return patched_future, patched_future_covariates_mask
 
-    
-    
+
+    # def _compute_loss(
+#         self,
+#         context: torch.Tensor,
+#         quantile_preds: torch.Tensor,
+#         future_target: torch.Tensor,
+#         future_target_mask: torch.Tensor | None,
+#         patched_future_covariates_mask: torch.Tensor,
+#         loc_scale: tuple[torch.Tensor, torch.Tensor],
+#         num_output_patches: int,
+#     ) -> torch.Tensor:
+#         batch_size = future_target.shape[0]
+#         output_patch_size = self.chronos_config.output_patch_size
+#
+#         lambda_q = 0.05
+#         lambda_delta = 0.3
+#         eps = 1e-6
+#
+#         future_target, _ = self.instance_norm(future_target, loc_scale)
+#         future_target = future_target.unsqueeze(1).to(self.device)
+#
+#         context_normed, _ = self.instance_norm(context, loc_scale)
+#         context_normed = context_normed.to(self.device)
+#
+#         context_mask = ~torch.isnan(context_normed)
+#         last_context_idx = context_mask.long().sum(dim=-1).clamp_min(1) - 1
+#         last_context_value = context_normed[
+#             torch.arange(batch_size, device=self.device),
+#             last_context_idx,
+#         ].view(batch_size, 1, 1)
+#
+#         future_target_mask = (
+#             future_target_mask.unsqueeze(1).to(self.device)
+#             if future_target_mask is not None
+#             else ~torch.isnan(future_target)
+#         )
+#
+#         future_target = torch.where(
+#             future_target_mask > 0.0,
+#             future_target,
+#             torch.zeros_like(future_target),
+#         )
+#
+#         if quantile_preds.shape[-1] > future_target.shape[-1]:
+#             padding_shape = (
+#                 *future_target.shape[:-1],
+#                 quantile_preds.shape[-1] - future_target.shape[-1],
+#             )
+#
+#             future_target = torch.cat(
+#                 [future_target, torch.zeros(padding_shape).to(future_target)],
+#                 dim=-1,
+#             )
+#
+#             future_target_mask = torch.cat(
+#                 [future_target_mask, torch.zeros(padding_shape).to(future_target_mask)],
+#                 dim=-1,
+#             )
+#
+#         inv_future_covariate_mask = 1 - rearrange(
+#             patched_future_covariates_mask,
+#             "b n p -> b 1 (n p)",
+#             b=batch_size,
+#             n=num_output_patches,
+#             p=output_patch_size,
+#         )
+#
+#         loss_mask = future_target_mask.float() * inv_future_covariate_mask.float()
+#         valid_count = loss_mask.sum()
+#
+#         if valid_count.item() == 0:
+#             return quantile_preds.sum() * 0.0
+#
+#         q50_idx = torch.argmin(torch.abs(self.quantiles - 0.5)).item()
+#         pred_median = quantile_preds[:, q50_idx:q50_idx + 1, :]
+#
+#         # Quantile loss
+#         quantiles = rearrange(
+#             self.quantiles,
+#             "num_quantiles -> 1 num_quantiles 1",
+#         )
+#
+#         quantile_loss = 2 * torch.abs(
+#             (future_target - quantile_preds)
+#             * ((future_target <= quantile_preds).float() - quantiles)
+#         )
+#
+#         q_loss = (quantile_loss * loss_mask).sum() / valid_count
+#
+#         # Level RMSE
+#         level_mse = (
+#             ((pred_median - future_target) ** 2) * loss_mask
+#         ).sum() / valid_count
+#
+#         level_rmse = torch.sqrt(level_mse + eps)
+#
+#         # Delta RMSE
+#         # First delta uses true last observed context value:
+#         # pred_t - true_{t-1} versus true_t - true_{t-1}
+#         pred_with_base = torch.cat([last_context_value, pred_median], dim=-1)
+#         true_with_base = torch.cat([last_context_value, future_target], dim=-1)
+#
+#         pred_deltas = pred_with_base[..., 1:] - pred_with_base[..., :-1]
+#         true_deltas = true_with_base[..., 1:] - true_with_base[..., :-1]
+#
+#         delta_mse = (
+#             ((pred_deltas - true_deltas) ** 2) * loss_mask
+#         ).sum() / valid_count
+#
+#         delta_rmse = torch.sqrt(delta_mse + eps)
+#
+#         rmse_part = (
+#             (1.0 - lambda_delta) * level_rmse
+#             + lambda_delta * delta_rmse
+#         )
+#
+#         loss = lambda_q * q_loss + (1.0 - lambda_q) * rmse_part
+#
+#         return loss
+
     def _compute_loss(
         self,
         context: torch.Tensor,
@@ -508,16 +626,29 @@ class Chronos2Model(PreTrainedModel):
         loc_scale: tuple[torch.Tensor, torch.Tensor],
         num_output_patches: int,
     ) -> torch.Tensor:
+        """
+        Compute quantile loss on both levels (actual values) and first differences (changes).
+        
+        This approach:
+        - Uses quantile loss on levels (what is the predicted value?)
+        - Uses quantile loss on deltas (what is the predicted change?)
+        - Combines both with equal weighting
+        
+        Advantages:
+        - Both losses use the same quantile loss formula (balanced)
+        - Naturally handles both absolute accuracy and temporal consistency
+        - Single loss type is simpler to understand and tune
+        """
         batch_size = future_target.shape[0]
         output_patch_size = self.chronos_config.output_patch_size
-
-        lambda_q = 0.05
-        lambda_delta = 0.3
         eps = 1e-6
+        alpha = 0.5  # Weight between level and delta quantile losses (adjust as needed)
 
+        # ========== NORMALIZE TARGETS ==========
         future_target, _ = self.instance_norm(future_target, loc_scale)
         future_target = future_target.unsqueeze(1).to(self.device)
 
+        # ========== GET CONTEXT BASELINE ==========
         context_normed, _ = self.instance_norm(context, loc_scale)
         context_normed = context_normed.to(self.device)
 
@@ -528,6 +659,7 @@ class Chronos2Model(PreTrainedModel):
             last_context_idx,
         ].view(batch_size, 1, 1)
 
+        # ========== HANDLE TARGET MASK ==========
         future_target_mask = (
             future_target_mask.unsqueeze(1).to(self.device)
             if future_target_mask is not None
@@ -540,22 +672,22 @@ class Chronos2Model(PreTrainedModel):
             torch.zeros_like(future_target),
         )
 
+        # ========== PAD IF NEEDED ==========
         if quantile_preds.shape[-1] > future_target.shape[-1]:
             padding_shape = (
                 *future_target.shape[:-1],
                 quantile_preds.shape[-1] - future_target.shape[-1],
             )
-
             future_target = torch.cat(
-                [future_target, torch.zeros(padding_shape).to(future_target)],
+                [future_target, torch.zeros(padding_shape, device=self.device, dtype=self.dtype)],
                 dim=-1,
             )
-
             future_target_mask = torch.cat(
-                [future_target_mask, torch.zeros(padding_shape).to(future_target_mask)],
+                [future_target_mask, torch.zeros(padding_shape, device=self.device, dtype=future_target_mask.dtype)],
                 dim=-1,
             )
 
+        # ========== CREATE LOSS MASK ==========
         inv_future_covariate_mask = 1 - rearrange(
             patched_future_covariates_mask,
             "b n p -> b 1 (n p)",
@@ -570,52 +702,55 @@ class Chronos2Model(PreTrainedModel):
         if valid_count.item() == 0:
             return quantile_preds.sum() * 0.0
 
-        q50_idx = torch.argmin(torch.abs(self.quantiles - 0.5)).item()
-        pred_median = quantile_preds[:, q50_idx:q50_idx + 1, :]
-
-        # Quantile loss
+        # ========== QUANTILE LOSS ON LEVELS ==========
         quantiles = rearrange(
             self.quantiles,
             "num_quantiles -> 1 num_quantiles 1",
         )
 
-        quantile_loss = 2 * torch.abs(
+        quantile_loss_levels = 2 * torch.abs(
             (future_target - quantile_preds)
             * ((future_target <= quantile_preds).float() - quantiles)
         )
 
-        q_loss = (quantile_loss * loss_mask).sum() / valid_count
+        q_loss_levels = (quantile_loss_levels * loss_mask).sum() / valid_count
 
-        # Level RMSE
-        level_mse = (
-            ((pred_median - future_target) ** 2) * loss_mask
-        ).sum() / valid_count
+        # ========== QUANTILE LOSS ON FIRST DIFFERENCES ==========
+        # Compute first differences (deltas) with context baseline
+        true_with_base = torch.cat([last_context_value, future_target], dim=-1)  # (batch, 1, seq+1)
+        pred_with_base = torch.cat([last_context_value, quantile_preds], dim=-1)  # (batch, num_quantiles, seq+1)
 
-        level_rmse = torch.sqrt(level_mse + eps)
+        true_deltas = true_with_base[..., 1:] - true_with_base[..., :-1]  # (batch, 1, seq)
+        pred_deltas = pred_with_base[..., 1:] - pred_with_base[..., :-1]  # (batch, num_quantiles, seq)
 
-        # Delta RMSE
-        # First delta uses true last observed context value:
-        # pred_t - true_{t-1} versus true_t - true_{t-1}
-        pred_with_base = torch.cat([last_context_value, pred_median], dim=-1)
-        true_with_base = torch.cat([last_context_value, future_target], dim=-1)
+        # Normalize deltas by their standard deviation to make them comparable in scale to levels
+        # This prevents delta loss from being drowned out by level loss
+        true_delta_std = torch.std(true_deltas) + eps
+        true_deltas_normalized = true_deltas / true_delta_std
+        pred_deltas_normalized = pred_deltas / true_delta_std
 
-        pred_deltas = pred_with_base[..., 1:] - pred_with_base[..., :-1]
-        true_deltas = true_with_base[..., 1:] - true_with_base[..., :-1]
-
-        delta_mse = (
-            ((pred_deltas - true_deltas) ** 2) * loss_mask
-        ).sum() / valid_count
-
-        delta_rmse = torch.sqrt(delta_mse + eps)
-
-        rmse_part = (
-            (1.0 - lambda_delta) * level_rmse
-            + lambda_delta * delta_rmse
+        # Apply quantile loss to normalized deltas
+        quantile_loss_deltas = 2 * torch.abs(
+            (true_deltas_normalized - pred_deltas_normalized)
+            * ((true_deltas_normalized <= pred_deltas_normalized).float() - quantiles)
         )
 
-        loss = lambda_q * q_loss + (1.0 - lambda_q) * rmse_part
+        # Mask for deltas (one fewer element due to differencing)
+        loss_mask_deltas = loss_mask[..., 1:]  # (batch, 1, seq)
+        valid_count_deltas = loss_mask_deltas.sum()
+
+        if valid_count_deltas.item() == 0:
+            # If no valid deltas, skip delta loss
+            q_loss_deltas = torch.tensor(0.0, device=self.device, dtype=self.dtype)
+        else:
+            q_loss_deltas = (quantile_loss_deltas * loss_mask_deltas).sum() / valid_count_deltas
+
+        # ========== COMBINE LOSSES ==========
+        # Both are quantile losses, so they're balanced in scale
+        loss = alpha * q_loss_levels + (1.0 - alpha) * q_loss_deltas
 
         return loss
+
 
     def encode(
         self,
