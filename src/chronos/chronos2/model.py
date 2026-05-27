@@ -627,40 +627,62 @@ class Chronos2Model(PreTrainedModel):
         num_output_patches: int,
     ) -> torch.Tensor:
         """
-        Compute quantile loss on both levels (actual values) and first differences (changes).
-        
-        Shapes:
-        - context: (batch, seq_context)
-        - future_target: (batch, seq_future)
-        - quantile_preds: (batch, num_quantiles, seq_future)
-        - future_target_mask: (batch, seq_future) or None
+        Compute combined quantile loss on:
+
+        1. Forecast levels:
+            y_{t+h}
+
+        2. Forecast first differences:
+            y_{t+h} - y_{t+h-1}
+
+        The first delta uses the last valid context value as the baseline:
+
+            delta_0 = future_target_0 - last_context_value
+
+        This is not a fully proper quantile loss for the distribution of deltas,
+        because differences of quantiles are not quantiles of differences.
+        It should be understood as a movement / shape regularizer.
         """
+
         batch_size = future_target.shape[0]
         output_patch_size = self.chronos_config.output_patch_size
+
         eps = 1e-6
-        alpha = 0.5  # Weight between level and delta quantile losses
 
-        # ========== NORMALIZE TARGETS ==========
+        # Keep original level quantile loss dominant.
+        # Lower alpha gives stronger movement/delta pressure.
+        alpha = 0.8
+
+        # -------------------------------------------------------------------------
+        # Normalize future target using same loc/scale as context
+        # -------------------------------------------------------------------------
         future_target, _ = self.instance_norm(future_target, loc_scale)
-        future_target = future_target.unsqueeze(1).to(self.device)  # (batch, 1, seq)
+        future_target = future_target.unsqueeze(1).to(self.device)
+        # shape: (batch, 1, seq)
 
-        # ========== GET CONTEXT BASELINE ==========
+        # -------------------------------------------------------------------------
+        # Normalize context and extract last valid context value
+        # -------------------------------------------------------------------------
         context_normed, _ = self.instance_norm(context, loc_scale)
         context_normed = context_normed.to(self.device)
 
         context_mask = ~torch.isnan(context_normed)
+
         last_context_idx = context_mask.long().sum(dim=-1).clamp_min(1) - 1
+
         last_context_value = context_normed[
             torch.arange(batch_size, device=self.device),
             last_context_idx,
-        ].view(batch_size, 1, 1)  # (batch, 1, 1)
+        ].view(batch_size, 1, 1)
+        # shape: (batch, 1, 1)
 
-        # ========== HANDLE TARGET MASK ==========
-        future_target_mask = (
-            future_target_mask.unsqueeze(1).to(self.device)
-            if future_target_mask is not None
-            else ~torch.isnan(future_target)
-        )
+        # -------------------------------------------------------------------------
+        # Handle future target mask
+        # -------------------------------------------------------------------------
+        if future_target_mask is not None:
+            future_target_mask = future_target_mask.unsqueeze(1).to(self.device)
+        else:
+            future_target_mask = ~torch.isnan(future_target)
 
         future_target = torch.where(
             future_target_mask > 0.0,
@@ -668,22 +690,41 @@ class Chronos2Model(PreTrainedModel):
             torch.zeros_like(future_target),
         )
 
-        # ========== PAD IF NEEDED ==========
+        # -------------------------------------------------------------------------
+        # Pad future target/mask if quantile_preds is longer
+        # -------------------------------------------------------------------------
         if quantile_preds.shape[-1] > future_target.shape[-1]:
-            padding_shape = (
-                *future_target.shape[:-1],
-                quantile_preds.shape[-1] - future_target.shape[-1],
-            )
+            pad_len = quantile_preds.shape[-1] - future_target.shape[-1]
+
+            padding_shape = (*future_target.shape[:-1], pad_len)
+
             future_target = torch.cat(
-                [future_target, torch.zeros(padding_shape, device=self.device, dtype=self.dtype)],
-                dim=-1,
-            )
-            future_target_mask = torch.cat(
-                [future_target_mask, torch.zeros(padding_shape, device=self.device, dtype=future_target_mask.dtype)],
+                [
+                    future_target,
+                    torch.zeros(
+                        padding_shape,
+                        device=self.device,
+                        dtype=future_target.dtype,
+                    ),
+                ],
                 dim=-1,
             )
 
-        # ========== CREATE LOSS MASK ==========
+            future_target_mask = torch.cat(
+                [
+                    future_target_mask,
+                    torch.zeros(
+                        padding_shape,
+                        device=self.device,
+                        dtype=future_target_mask.dtype,
+                    ),
+                ],
+                dim=-1,
+            )
+
+        # -------------------------------------------------------------------------
+        # Mask out positions that correspond to future covariates
+        # -------------------------------------------------------------------------
         inv_future_covariate_mask = 1 - rearrange(
             patched_future_covariates_mask,
             "b n p -> b 1 (n p)",
@@ -692,75 +733,95 @@ class Chronos2Model(PreTrainedModel):
             p=output_patch_size,
         )
 
-        loss_mask = future_target_mask.float() * inv_future_covariate_mask.float()  # (batch, 1, seq)
+        loss_mask = future_target_mask.float() * inv_future_covariate_mask.float()
+        # shape: (batch, 1, seq)
+
         valid_count = loss_mask.sum()
 
         if valid_count.item() == 0:
             return quantile_preds.sum() * 0.0
 
-        # ========== QUANTILE LOSS ON LEVELS ==========
+        # -------------------------------------------------------------------------
+        # Quantile loss on levels
+        # -------------------------------------------------------------------------
         quantiles = rearrange(
             self.quantiles,
             "num_quantiles -> 1 num_quantiles 1",
-        )
+        ).to(self.device)
 
-        # quantile_preds: (batch, num_quantiles, seq)
-        # future_target: (batch, 1, seq)
-        # loss_mask: (batch, 1, seq)
-        # Broadcasting handles the dimension mismatch automatically
         quantile_loss_levels = 2 * torch.abs(
-            (future_target - quantile_preds)  # (batch, 1, seq) - (batch, num_quantiles, seq) = (batch, num_quantiles, seq)
+            (future_target - quantile_preds)
             * ((future_target <= quantile_preds).float() - quantiles)
         )
+        # shape: (batch, num_quantiles, seq)
 
-        q_loss_levels = (quantile_loss_levels * loss_mask).sum() / valid_count
-
-        # ========== QUANTILE LOSS ON FIRST DIFFERENCES ==========
-        # Compute first differences (deltas) with context baseline
-        
-        # Expand last_context_value to match quantile dimension for proper concatenation
-        # (batch, 1, 1) -> (batch, num_quantiles, 1)
-        last_context_value_expanded = last_context_value.expand(batch_size, self.num_quantiles, 1)
-        
-        # Concat with predictions per quantile
-        # (batch, num_quantiles, 1) + (batch, num_quantiles, seq) = (batch, num_quantiles, seq+1)
-        pred_with_base = torch.cat([last_context_value_expanded, quantile_preds], dim=-1)
-        
-        # For targets, keep (batch, 1, seq+1) - will broadcast when needed
-        # (batch, 1, 1) + (batch, 1, seq) = (batch, 1, seq+1)
-        true_with_base = torch.cat([last_context_value, future_target], dim=-1)
-
-        # Compute deltas (first differences)
-        # pred_deltas: (batch, num_quantiles, seq)
-        # true_deltas: (batch, 1, seq)
-        pred_deltas = pred_with_base[..., 1:] - pred_with_base[..., :-1]
-        true_deltas = true_with_base[..., 1:] - true_with_base[..., :-1]
-
-        # Normalize deltas by their standard deviation to make them comparable to levels
-        true_delta_std = torch.std(true_deltas) + eps
-        true_deltas_normalized = true_deltas / true_delta_std
-        pred_deltas_normalized = pred_deltas / true_delta_std
-
-        # Apply quantile loss to normalized deltas
-        # true_deltas_normalized: (batch, 1, seq)
-        # pred_deltas_normalized: (batch, num_quantiles, seq)
-        # Broadcasting: (batch, 1, seq) - (batch, num_quantiles, seq) = (batch, num_quantiles, seq)
-        quantile_loss_deltas = 2 * torch.abs(
-            (true_deltas_normalized - pred_deltas_normalized)
-            * ((true_deltas_normalized <= pred_deltas_normalized).float() - quantiles)
+        q_loss_levels = (
+            (quantile_loss_levels * loss_mask).sum()
+            / (valid_count * self.num_quantiles)
         )
 
-        # Mask for deltas (one fewer element due to differencing)
-        # (batch, 1, seq-1)
-        loss_mask_deltas = loss_mask[..., 1:]
+        # -------------------------------------------------------------------------
+        # Quantile-like loss on first differences
+        # -------------------------------------------------------------------------
+
+        # Expand last context value across quantiles:
+        # (batch, 1, 1) -> (batch, num_quantiles, 1)
+        last_context_value_expanded = last_context_value.expand(
+            batch_size,
+            self.num_quantiles,
+            1,
+        )
+
+        # Add baseline before forecast sequence.
+        pred_with_base = torch.cat(
+            [last_context_value_expanded, quantile_preds],
+            dim=-1,
+        )
+        # shape: (batch, num_quantiles, seq + 1)
+
+        true_with_base = torch.cat(
+            [last_context_value, future_target],
+            dim=-1,
+        )
+        # shape: (batch, 1, seq + 1)
+
+        pred_deltas = pred_with_base[..., 1:] - pred_with_base[..., :-1]
+        true_deltas = true_with_base[..., 1:] - true_with_base[..., :-1]
+        # both have seq deltas because first delta uses last context value
+
+        # Important:
+        # Do NOT use loss_mask[..., 1:] here.
+        # pred_deltas and true_deltas both have length seq.
+        loss_mask_deltas = loss_mask
         valid_count_deltas = loss_mask_deltas.sum()
 
         if valid_count_deltas.item() == 0:
-            q_loss_deltas = torch.tensor(0.0, device=self.device, dtype=self.dtype)
+            q_loss_deltas = quantile_preds.sum() * 0.0
         else:
-            q_loss_deltas = (quantile_loss_deltas * loss_mask_deltas).sum() / valid_count_deltas
+            valid_delta_values = true_deltas[loss_mask_deltas.bool()]
 
-        # ========== COMBINE LOSSES ==========
+            true_delta_std = valid_delta_values.std().clamp_min(eps)
+
+            true_deltas_normalized = true_deltas / true_delta_std
+            pred_deltas_normalized = pred_deltas / true_delta_std
+
+            quantile_loss_deltas = 2 * torch.abs(
+                (true_deltas_normalized - pred_deltas_normalized)
+                * (
+                    (true_deltas_normalized <= pred_deltas_normalized).float()
+                    - quantiles
+                )
+            )
+            # shape: (batch, num_quantiles, seq)
+
+            q_loss_deltas = (
+                (quantile_loss_deltas * loss_mask_deltas).sum()
+                / (valid_count_deltas * self.num_quantiles)
+            )
+
+        # -------------------------------------------------------------------------
+        # Combined loss
+        # -------------------------------------------------------------------------
         loss = alpha * q_loss_levels + (1.0 - alpha) * q_loss_deltas
 
         return loss
